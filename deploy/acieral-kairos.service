@@ -1,0 +1,21 @@
+[Unit]
+Description=Acieral Kairos Bot — Aureyn Algorithmic Trading
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/acieral-kairos-bot
+ExecStart=/home/ubuntu/acieral-kairos-bot/venv/bin/python -m bot.main
+Restart=on-failure
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+Environment=ACIERAL_DB_MODE=pool
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=acieral-kairos
+
+[Install]
+WantedBy=multi-user.target

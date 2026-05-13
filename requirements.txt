@@ -1,0 +1,13 @@
+oandapyV20
+pandas
+numpy
+python-dotenv
+ta
+xgboost
+imbalanced-learn
+scikit-learn
+yfinance
+APScheduler
+requests
+pyarrow
+fastparquet

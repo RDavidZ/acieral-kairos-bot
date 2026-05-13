@@ -1,0 +1,5 @@
+scenario,label,start_equity,end_equity,total_return_pct,total_pnl,total_trades,win_rate,profit_factor,sharpe,max_dd_pct,sizing_failures,risk_breaches
+A,"SCENARIO A -- GBP 50k, tiered risk, no caps",50000,493689.34,887.38,443689.34,587,87.7,51.38,9.42,-0.42,1,0
+B,"SCENARIO B -- GBP 50k, tiered risk, unit caps",50000,407916.72,715.83,357916.72,587,87.7,44.658,7.985,-0.4,1,0
+C,"SCENARIO C -- GBP 100k, tiered risk, no caps",100000,693786.48,593.79,593786.48,587,87.7,51.48,9.449,-0.28,1,0
+D,"SCENARIO D -- GBP 100k, tiered risk, unit caps",100000,568947.36,468.95,468947.36,587,87.7,46.509,7.875,-0.29,1,0
