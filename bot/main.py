@@ -370,9 +370,11 @@ class AcieralKairosBot:
             # Pass a flag to manage_open_trade to skip exit model outside session
             close_now, news_reason = should_close_pre_news(instrument, now)
             if close_now:
-                log.warning("[%s] Pre-news close (outside session) — %s", instrument, news_reason)
+                log.warning("[%s] Pre-news triggered (outside session) — %s", instrument, news_reason)
                 eq_before   = self.risk.equity
-                exit_reason = self.order_manager.force_close(instrument, "NEWS_CLOSE", now)
+                exit_reason = self.order_manager.handle_pre_news(
+                    instrument, float(current_candle["close"]), now
+                )
             else:
                 eq_before   = self.risk.equity
                 exit_reason = self.order_manager.manage_open_trade(
@@ -392,23 +394,20 @@ class AcieralKairosBot:
 
         # Market is open — proceed with normal flow (existing code continues unchanged from here)
 
-        # 2. Fetch latest 500 H1 candles (500 bars = ~21 days; gives swing
-        #    detector enough history to match backtest structural analysis)
+        # 2. Build live feature row from the feature cache (updated at HH:00, ~1 min ago).
+        # build_live_features_v2 reads from the pre-computed parquet and ignores the
+        # live_h1_df argument. Previously, a 500-bar OANDA fetch gated this call with a
+        # len < 50 guard — but OANDA was repeatedly returning only 10 bars (matching the
+        # HH:00 cache-update fetch), causing all instruments to be silently skipped for
+        # multi-hour windows. The fetch is no longer needed here.
         try:
-            h1_df = self.client.get_latest_candles(instrument, granularity="H1", count=500)
-        except Exception as exc:
-            log.error("[%s] Candle fetch failed: %s", instrument, exc)
-            return
-
-        if len(h1_df) < 50:
-            log.warning("[%s] Only %d candles returned — skipping", instrument, len(h1_df))
-            return
-
-        # 3. Build live feature row
-        try:
-            current_candle = build_live_features_v2(instrument, h1_df, now=now)
+            current_candle = build_live_features_v2(instrument, pd.DataFrame(), now=now)
         except Exception as exc:
             log.error("[%s] build_live_features_v2 failed: %s", instrument, exc, exc_info=True)
+            return
+
+        if current_candle is None:
+            log.warning("[%s] No feature row available — skipping", instrument)
             return
 
         # 4. Manage open trade (before evaluating new entry)
@@ -425,13 +424,13 @@ class AcieralKairosBot:
                 except Exception as exc:
                     log.warning("[%s] Could not patch atr_at_entry: %s", instrument, exc)
 
-            # 4a. Pre-news close — High impact event ≤15 min away
+            # 4a. Pre-news management — High impact event ≤15 min away
             close_now, news_reason = should_close_pre_news(instrument, now)
             if close_now:
-                log.warning("[%s] Pre-news close — %s", instrument, news_reason)
+                log.warning("[%s] Pre-news triggered — %s", instrument, news_reason)
                 eq_before   = self.risk.equity
-                exit_reason = self.order_manager.force_close(
-                    instrument, "NEWS_CLOSE", now
+                exit_reason = self.order_manager.handle_pre_news(
+                    instrument, float(current_candle["close"]), now
                 )
             else:
                 eq_before   = self.risk.equity
@@ -609,7 +608,7 @@ class AcieralKairosBot:
         from data.fetcher        import fetch_all
         from data.preprocessor   import preprocess_all
         from strategy.feature_builder import build_all
-        from ml.labeler          import label_all
+        from ml.labeler          import label_instrument
         from ml.trainer          import train_instrument
 
         # 1. Fetch latest data
@@ -646,7 +645,7 @@ class AcieralKairosBot:
                 T = float(inst_params["T"])
 
                 log.info("[%s] Labelling N=%d T=%.4f…", instrument, N, T)
-                label_all(instruments=[instrument], N_values=[N], T_values=[T])
+                label_instrument(instrument, N, T)
 
                 log.info("[%s] Training…", instrument)
                 result = train_instrument(instrument, N, T)

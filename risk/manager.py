@@ -26,7 +26,6 @@ INDEX_INSTRUMENTS = _HC["INDEX_INSTRUMENTS"]
 
 MAX_OPEN_FOREX    = _HC["MAX_OPEN_TRADES_FOREX"]
 MAX_OPEN_INDICES  = _HC["MAX_OPEN_TRADES_INDICES"]
-MAX_OPEN_TOTAL    = _HC["MAX_OPEN_TRADES_TOTAL"]
 DD_KILL_PCT       = _HC["DAILY_DRAWDOWN_KILL_PCT"]
 COOLDOWN_HOURS    = _HC["REENTRY_COOLDOWN_HOURS"]
 CONF_FLOOR        = _HC["REENTRY_CONFIDENCE_FLOOR"]
@@ -136,11 +135,7 @@ class RiskManager:
             if self._open_indices >= MAX_OPEN_INDICES:
                 return False, "Index limit reached"
 
-        # 8. Total simultaneous open-trade limit
-        if (self._open_forex + self._open_indices) >= MAX_OPEN_TOTAL:
-            return False, "Total limit reached"
-
-        # 9. Forex weekend close — no new entries Friday ≥ 21:00 UTC
+        # 8. Forex weekend close — no new entries Friday ≥ 21:00 UTC
         if instrument in FOREX_PAIRS:
             if now.weekday() == 4 and now.hour >= 21:
                 return False, "Forex weekend close"

@@ -702,21 +702,98 @@ class OrderManager:
                         )
                         return self.force_close(instrument, "EOD", now)
 
-        # --- Real-time pre-news close check ---
-        # Pure datetime comparison against cached news schedule — no network call.
-        # try/except ensures a news filter failure never kills the streaming thread.
+        # --- Real-time pre-news check ---
+        # Uses should_close_pre_news (0–15 min window) — same window as the
+        # candle-close path.  Applies P&L-aware logic: close on loss,
+        # move SL to BE on profit without trail, do nothing if trail active.
         try:
-            from risk.news_filter import should_block_entry
-            blocked, reason = should_block_entry(instrument, now)
-            if blocked and self.risk.get_open_trade(instrument):
-                log.info(
-                    "[%s] Pre-news block detected on tick — force closing (%s)",
-                    instrument, reason,
-                )
-                self.force_close(instrument, "PRE_NEWS", now)
+            from risk.news_filter import should_close_pre_news
+            close_news, _reason = should_close_pre_news(instrument, now)
+            if close_news and self.risk.get_open_trade(instrument):
+                self.handle_pre_news(instrument, current_price, now)
                 return
         except Exception:
             pass
+
+        return None
+
+    # ------------------------------------------------------------------
+    # P&L-aware pre-news management
+    # ------------------------------------------------------------------
+
+    def handle_pre_news(
+        self,
+        instrument: str,
+        current_price: float,
+        now: datetime,
+    ) -> str | None:
+        """
+        Called when a High impact news event is 0–15 min away.
+
+        Decision tree (based on floating P&L and trail state):
+          Floating loss           → close immediately (NEWS_CLOSE)
+          Profit + trail active   → do nothing; trail SL already above entry
+          Profit + trail inactive → move SL to breakeven; trade stays open
+
+        Returns the exit_reason string if the trade was closed, else None.
+        """
+        trade = self.risk.get_open_trade(instrument)
+        if trade is None:
+            return None
+
+        unrealised_pnl = self._compute_pnl_gbp(instrument, trade, current_price, now)
+        direction      = int(trade["direction"])   # 1=LONG, -1=SHORT
+        entry_price    = float(trade["entry_price"])
+        current_sl     = float(trade["sl_price"])
+
+        if unrealised_pnl < 0:
+            # Floating loss — close before news hits
+            log.warning(
+                "[%s] Pre-news: floating loss £%.2f — closing immediately",
+                instrument, unrealised_pnl,
+            )
+            return self.force_close(instrument, "NEWS_CLOSE", now)
+
+        if trade.get("trail_activated", False):
+            # Trail already ratcheted SL above entry — no forced action needed
+            log.info(
+                "[%s] Pre-news: trail active — no action "
+                "(sl=%.5f unrealised=£%.2f)",
+                instrument, current_sl, unrealised_pnl,
+            )
+            return None
+
+        # Floating profit, trail not yet active → move SL to breakeven
+        # Only move if breakeven is genuinely an improvement over current SL
+        if direction == 1 and entry_price <= current_sl:
+            log.info(
+                "[%s] Pre-news: SL already at/beyond breakeven — no action",
+                instrument,
+            )
+            return None
+        if direction == -1 and entry_price >= current_sl:
+            log.info(
+                "[%s] Pre-news: SL already at/beyond breakeven — no action",
+                instrument,
+            )
+            return None
+
+        new_sl = entry_price
+        try:
+            self.client.update_stop_loss(trade["trade_id"], instrument, new_sl)
+            trade["sl_price"] = new_sl
+            self.risk.update_sl(instrument, new_sl)
+            log.info(
+                "[%s] Pre-news: SL moved to breakeven %.5f (was %.5f) "
+                "unrealised=£%.2f — trade stays open",
+                instrument, new_sl, current_sl, unrealised_pnl,
+            )
+        except Exception as exc:
+            log.warning(
+                "[%s] Pre-news: breakeven SL update failed (%s) — falling back to force close",
+                instrument, exc,
+            )
+            return self.force_close(instrument, "NEWS_CLOSE", now)
 
         return None
 
