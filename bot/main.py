@@ -635,7 +635,20 @@ class AcieralKairosBot:
             log.error("Feature build failed — retrain aborted: %s", exc)
             return
 
-        # 4–6. Label + retrain per instrument
+        # 4. Advance HOLDOUT_START to today so the retrain includes all live data.
+        #    Without this patch every retrain would train on the same fixed window
+        #    (2017–2024) and never learn from post-cutoff market regimes.
+        import ml.labeler as _ml_labeler
+        import ml.trainer as _ml_trainer
+        holdout_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _ml_labeler.HOLDOUT_START = holdout_str
+        _ml_trainer.HOLDOUT_START = holdout_str
+        log.info(
+            "Retrain HOLDOUT_START set to %s  (training window: %s → %s)",
+            holdout_str, HARD_CONSTRAINTS["TRAINING_START"], holdout_str,
+        )
+
+        # 5–7. Label + retrain per instrument
         retrain_results: dict = {}
 
         for instrument in self.active_instruments:
