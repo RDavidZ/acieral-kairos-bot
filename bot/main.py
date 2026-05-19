@@ -171,6 +171,15 @@ class AcieralKairosBot:
             log.warning("Startup reconciliation failed (non-blocking): %s", exc)
         self.order_manager.reconcile_db_trades()
 
+        # Refresh GBP conversion rates before streaming starts so any tick-based
+        # trade close that fires immediately after reconnect uses real rates, not
+        # the 1.0 default (which produced £0.00 P&L on the first post-restart close).
+        try:
+            self.order_manager.refresh_gbpusd_rate()
+            log.info("GBP rates refreshed on startup")
+        except Exception as exc:
+            log.warning("Startup GBP rate refresh failed (non-blocking): %s", exc)
+
         log.info(
             "Bot ready | instruments=%d | equity=£%.2f",
             len(self.active_instruments), balance,
@@ -687,6 +696,107 @@ class AcieralKairosBot:
 
         self.telegram.send_retrain_complete(retrain_results)
         log.info("=== Retrain complete ===")
+
+        # Sync freshly-trained models + config to FTMO Windows VPS so both
+        # bots use identical weights and confidence thresholds.
+        self._sync_models_to_ftmo()
+
+    def _sync_models_to_ftmo(self) -> None:
+        """
+        Push model files to the FTMO Windows VPS after each retrain.
+
+        Uses SSH key authentication (same key the acieral VPS already uses to
+        reach the FTMO VPS).  Requires environment variables:
+          FTMO_VPS_HOST      — e.g. 212.227.210.56
+          FTMO_VPS_USER      — e.g. Administrator
+          FTMO_VPS_BOT_PATH  — e.g. C:/projects/kairos-ftmo  (forward slashes)
+          FTMO_VPS_KEY_PATH  — path to SSH private key (default ~/.ssh/id_ed25519)
+
+        FTMO_VPS_PASSWORD is optional (only used if key auth fails).
+        """
+        host     = os.getenv("FTMO_VPS_HOST")
+        user     = os.getenv("FTMO_VPS_USER")
+        password = os.getenv("FTMO_VPS_PASSWORD")       # optional
+        key_path = os.getenv("FTMO_VPS_KEY_PATH", os.path.expanduser("~/.ssh/id_ed25519"))
+        bot_path = os.getenv("FTMO_VPS_BOT_PATH", "C:/projects/kairos-ftmo")
+
+        if not (host and user):
+            log.warning(
+                "FTMO model sync skipped — FTMO_VPS_HOST / FTMO_VPS_USER not set in environment"
+            )
+            return
+
+        try:
+            import paramiko
+        except ImportError:
+            log.warning("FTMO model sync skipped — paramiko not installed (pip install paramiko)")
+            return
+
+        local_models_dir = _MODELS_DIR
+        remote_models_dir = bot_path.rstrip("/") + "/ml/models"
+
+        files_to_sync: list[tuple[Path, str]] = []
+
+        # All entry and exit model files
+        for pkl in local_models_dir.glob("*.pkl"):
+            files_to_sync.append((pkl, remote_models_dir + "/" + pkl.name))
+
+        if not files_to_sync:
+            log.warning("FTMO model sync: no model files found in %s", local_models_dir)
+            return
+
+        log.info("Syncing %d files to FTMO VPS %s@%s…", len(files_to_sync), user, host)
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            # Try key auth first, fall back to password
+            connect_kwargs: dict = {"username": user, "timeout": 30}
+            if os.path.exists(key_path):
+                connect_kwargs["key_filename"] = key_path
+                connect_kwargs["look_for_keys"] = False
+            elif password:
+                connect_kwargs["password"] = password
+            else:
+                connect_kwargs["look_for_keys"] = True
+            ssh.connect(host, **connect_kwargs)
+            sftp = ssh.open_sftp()
+
+            synced, failed = 0, 0
+            for local_path, remote_path in files_to_sync:
+                try:
+                    # Ensure remote directory exists
+                    remote_dir = remote_path.rsplit("/", 1)[0]
+                    try:
+                        sftp.stat(remote_dir)
+                    except FileNotFoundError:
+                        # mkdir -p via sequential mkdir calls
+                        parts = remote_dir.lstrip("/").split("/")
+                        cur = ""
+                        for part in parts:
+                            cur = cur + "/" + part if cur else part
+                            try:
+                                sftp.mkdir(cur)
+                            except OSError:
+                                pass  # already exists
+                    sftp.put(str(local_path), remote_path)
+                    log.info("  → %s", remote_path)
+                    synced += 1
+                except Exception as e:
+                    log.error("  ✗ %s: %s", remote_path, e)
+                    failed += 1
+
+            sftp.close()
+            ssh.close()
+            log.info(
+                "FTMO model sync complete — %d synced, %d failed", synced, failed
+            )
+            if failed == 0:
+                self.telegram.send_message(
+                    f"🔄 FTMO model sync complete — {synced} files pushed to {host}"
+                )
+        except Exception as exc:
+            log.error("FTMO model sync failed: %s", exc, exc_info=True)
+            self.telegram.send_message(f"⚠️ FTMO model sync failed: {exc}")
 
     # ------------------------------------------------------------------
     # News DB sync — every 12 hours

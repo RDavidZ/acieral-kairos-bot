@@ -441,7 +441,7 @@ class OandaClient:
             result.append({
                 "trade_id":      t["id"],
                 "instrument":    t["instrument"],
-                "units":         int(float(t["currentUnits"])),
+                "units":         float(t["currentUnits"]),
                 "open_price":    float(t["price"]),
                 "current_price": float(t.get("currentPriceAsk", t.get("price", 0.0))),
                 "unrealised_pl": float(t.get("unrealizedPL", 0.0)),
@@ -498,9 +498,7 @@ class OandaClient:
         if instrument in INDEX_INSTRUMENTS:
             if wd >= 5:                          # Weekend: closed
                 return False
-            open_hm  = _SESSION_OPEN_UTC[instrument]
-            close_hm = _SESSION_CLOSE_UTC[instrument]
-            return open_hm <= hm < close_hm
+            return True                          # Open all weekday hours — index CFDs trade 23h/day
 
         log.warning(
             "is_market_open: unknown instrument '%s' — returning True", instrument

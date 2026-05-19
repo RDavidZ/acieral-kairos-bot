@@ -29,7 +29,6 @@ MAX_OPEN_INDICES  = _HC["MAX_OPEN_TRADES_INDICES"]
 DD_KILL_PCT       = _HC["DAILY_DRAWDOWN_KILL_PCT"]
 COOLDOWN_HOURS    = _HC["REENTRY_COOLDOWN_HOURS"]
 CONF_FLOOR        = _HC["REENTRY_CONFIDENCE_FLOOR"]
-MAX_PER_DAY       = _HC["MAX_TRADES_PER_INSTRUMENT_PER_DAY"]
 QUOTE_TYPE        = _HC["INSTRUMENT_QUOTE_TYPE"]
 RISK_PCT          = _HC["RISK_PER_TRADE"]
 MAX_RISK_GBP      = _HC["MAX_RISK_PER_TRADE_GBP"]
@@ -110,15 +109,7 @@ class RiskManager:
         if instrument in self._open_trades:
             return False, "Open trade exists"
 
-        # 3. Instrument already traded today
-        if instrument in self._traded_today:
-            return False, "Already traded today"
-
-        # 4. Per-instrument daily trade count
-        if self._pair_trade_count.get(instrument, 0) >= MAX_PER_DAY:
-            return False, "Daily trade limit reached"
-
-        # 5. Re-entry cooldown + low confidence
+        # 3. Re-entry cooldown + low confidence
         #    Cooldown alone does not block — only cooldown AND low confidence.
         if instrument in self._last_close_time:
             elapsed = now - self._last_close_time[instrument]

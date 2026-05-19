@@ -11,3 +11,4 @@ APScheduler
 requests
 pyarrow
 fastparquet
+paramiko
