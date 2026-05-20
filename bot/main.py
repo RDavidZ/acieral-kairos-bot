@@ -840,10 +840,10 @@ class AcieralKairosBot:
 
     def _update_feature_cache_job(self) -> None:
         """
-        Incrementally update the H1 feature cache for all active instruments.
-        Fetches only the latest 10 H1 bars per instrument, appends any new bars
-        to the raw H1 parquet, then rebuilds the feature cache only when new
-        bars are present (at most 1 new bar per instrument per hour).
+        Incrementally update the feature cache for all active instruments.
+        Fetches the latest H1 bars plus H4/D1/W1 bars per instrument; appends
+        any new bars to the respective raw parquets, then rebuilds the feature
+        cache only when new H1 bars are present (at most 1 per hour).
 
         Runs at HH:00 UTC — one minute before candle close at HH:01.
         Typical runtime: ~2.5s per instrument × 8 instruments = ~20s total,
@@ -889,6 +889,32 @@ class AcieralKairosBot:
                           .sort_values("time")
                           .reset_index(drop=True))
                 raw.to_parquet(raw_path, index=False)
+
+                # Step 2b: incrementally refresh H4, D1, W1 caches so HTF features stay current.
+                # Without this, D1/H4 parquets only update at bot startup (causing stale HTF features).
+                for htf_tf, htf_filename in [("H4", f"{instrument}_H4.parquet"),
+                                              ("D",  f"{instrument}_D.parquet"),
+                                              ("W",  f"{instrument}_W.parquet")]:
+                    htf_path = cache_dir / htf_filename
+                    if not htf_path.exists():
+                        continue
+                    try:
+                        htf_bars = self.client.get_latest_candles(instrument, granularity=htf_tf, count=5)
+                        if htf_bars is None or htf_bars.empty:
+                            continue
+                        htf_bars["time"] = pd.to_datetime(htf_bars["time"], utc=True)
+                        htf_raw = pd.read_parquet(htf_path)
+                        htf_raw["time"] = pd.to_datetime(htf_raw["time"], utc=True)
+                        htf_new = htf_bars[htf_bars["time"] > htf_raw["time"].max()]
+                        if not htf_new.empty:
+                            htf_raw = pd.concat([htf_raw, htf_new], ignore_index=True)
+                            htf_raw = (htf_raw.drop_duplicates(subset=["time"])
+                                              .sort_values("time")
+                                              .reset_index(drop=True))
+                            htf_raw.to_parquet(htf_path, index=False)
+                            log.debug("[%s] HTF %s cache updated (+%d bars)", instrument, htf_tf, len(htf_new))
+                    except Exception as htf_exc:
+                        log.warning("[%s] HTF %s cache update failed: %s", instrument, htf_tf, htf_exc)
 
                 # Step 3: run preprocessor for this instrument to update processed parquet
                 try:
