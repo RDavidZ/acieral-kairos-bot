@@ -1,44 +1,49 @@
-Fix the feature_builder.py divergence between the FTMO bot and OANDA bot.
+In `acieral-kairos-bot/`, delete the following files and directories from the working tree on the main branch. These are all safely archived on `archive/pre-synthetic-htf-rebuild-2026-05-23`.
 
-SSH access:
-- Oracle VPS: ubuntu@132.145.33.221
-- IONOS VPS: Administrator@212.227.210.56
+Delete:
+```bash
+# Trained models
+rm -rf ml/models/entry_*.pkl ml/models/exit_*.pkl ml/models/metadata.json ml/models/exit_metadata.json
 
-Step 1: Read both feature_builder.py files in full:
-- Oracle: /home/ubuntu/acieral-kairos-bot/strategy/feature_builder.py
-- IONOS: C:\projects\kairos-ftmo\strategy\feature_builder.py
+# Labels
+rm -rf ml/labels/ ml/labels_train/ ml/exit_labels/
 
-Step 2: Read the FTMO preprocessor to understand data structures it produces:
-- IONOS: C:\projects\kairos-ftmo\data\preprocessor.py
+# Multi-combo results
+rm -rf ml/multi_combo_results/
 
-Step 3: Replace C:\projects\kairos-ftmo\strategy\feature_builder.py with the Oracle version, making only the minimal changes needed to make it compatible with the FTMO preprocessor's data structures. Specifically:
-- Keep Oracle's NaN handling for FVG columns (do not fill with 0.0)
-- Keep Oracle's HTF loading from parquet files (not _htf_raw_cache)
-- Ensure file paths and cache directory references match the FTMO preprocessor's conventions
+# Backtest results
+rm -rf backtest/results/ backtest/results_train/ backtest/results_exit/
 
-Step 4: On the IONOS VPS, run this smoke test:
-cd C:\projects\kairos-ftmo
-$env:PYTHONPATH='C:\projects\kairos-ftmo'
-.\venv\Scripts\python.exe -c "
-import sys
-sys.path.insert(0, '.')
-from dotenv import load_dotenv
-load_dotenv()
-from pathlib import Path
-from data.preprocessor import load_cached_features, get_cache_dir
+# HTF raw parquets (H4, D1, W1) — H1 stays
+find data/cache -name "*_H4*.parquet" -delete
+find data/cache -name "*_D1*.parquet" -delete
+find data/cache -name "*_W1*.parquet" -delete
+find data/cache -name "*_D.parquet" -delete
+find data/cache -name "*_W.parquet" -delete
 
-cache_dir = get_cache_dir(1)
-feat = load_cached_features('EUR_USD', cache_dir=cache_dir)
-print(f'Features: {len(feat)}')
-print(f'NaNs: {feat.isna().sum()}')
-fvg_cols = [c for c in feat.index if 'fvg' in c.lower()]
-print(f'FVG cols: {fvg_cols}')
-print(f'FVG values: {feat[fvg_cols].to_dict()}')
-print('OK')
+# Feature cache parquets — will be rebuilt
+find data/cache -name "*_features.parquet" -delete
+
+# Archive folder on main (not needed here, lives on archive branch)
+rm -rf archive/
+```
+
+Then commit the deletions to main:
+```bash
+git add -A
+git commit -m "chore: remove pre-rebuild artifacts from main
+
+Models, labels, backtest results, HTF parquets and feature caches
+deleted. All preserved on archive/pre-synthetic-htf-rebuild-2026-05-23.
+H1 processed parquets kept — foundation for synthetic HTF rebuild.
 "
+```
 
-Step 5: Verify MD5 of feature_builder.py matches Oracle:
-- Oracle MD5: dab66b1a2f13607965af265e5f9104df
-- Check IONOS MD5 after replacement
+Verify what remains in key directories:
+```bash
+ls data/cache/
+ls ml/models/ 2>/dev/null || echo "ml/models empty or gone"
+ls ml/ 
+```
 
-Show full output. Stop and wait for instructions.
+Report what was deleted and what remains. Do not touch H1 parquets or any Python source files.

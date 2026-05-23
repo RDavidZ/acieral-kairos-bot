@@ -60,9 +60,17 @@ HARD_CONSTRAINTS = {
         "DE30_EUR":   "16:30",
     },
 
-    # Training
+    # Training / holdout split
+    # Walk-forward CV: 18-month rolling train window, 3-month val step.
+    # Training window: 2017-2024 (8 years, ~22 folds).
+    # Holdout 1 (2025): model selection — Sharpe-based N/T selection, exit threshold tuning.
+    # Holdout 2 (2026-present): final honest evaluation, sealed until deployment decision.
     "TRAINING_START": "2017-01-01",
-    "HOLDOUT_START": "2024-01-01",
+    "TRAINING_END": "2024-12-31",
+    "HOLDOUT_START": "2025-01-01",
+    "HOLDOUT_1_START": "2025-01-01",
+    "HOLDOUT_1_END": "2025-12-31",
+    "HOLDOUT_2_START": "2026-01-01",
     "TRAINING_WINDOW_MONTHS": 18,
     "VALIDATION_MONTHS": 3,
     "WALKFORWARD_RETRAIN_DAYS": 20,
