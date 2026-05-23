@@ -151,6 +151,9 @@ def _build_htf_cols(h1: pd.DataFrame, instrument: str,
         "structure_bias":  "h4_swing_bias",
     })
 
+    # Shift merge key to H4 bar close time (open + 4h) so incomplete/in-progress
+    # H4 bars only attach to H1 bars that open after the H4 bar has fully closed.
+    h4_ff["time"] = h4_ff["time"] + pd.Timedelta(hours=4)
     h1 = pd.merge_asof(h1, h4_ff, on="time", direction="backward")
 
     # Compute H4 FVG features on H1
@@ -190,6 +193,9 @@ def _build_htf_cols(h1: pd.DataFrame, instrument: str,
         "structure_bias":  "d1_swing_bias",
     })
 
+    # Shift merge key to D1 bar close time (open + 1 day) so today's in-progress
+    # D1 bar only attaches to tomorrow's H1 bars, matching what's knowable live.
+    d1_ff["time"] = d1_ff["time"] + pd.Timedelta(days=1)
     h1 = pd.merge_asof(h1, d1_ff, on="time", direction="backward")
 
     # D1 features computed on H1
@@ -790,6 +796,19 @@ def build_live_features_v2(
         "[%s] build_live_features_v2: cache row time=%s cols=%d",
         instrument, last_row["time"], len(cached.columns),
     )
+
+    # Emit an INFO-level note so every evaluation shows which bar's features are
+    # being used. Lag > 0 during a live session means a cache update was missed.
+    if now is not None:
+        _now_ts    = pd.Timestamp(now).tz_convert("UTC")
+        _bar_ts    = pd.Timestamp(last_row["time"]).tz_convert("UTC")
+        _expected  = _now_ts.floor("H") - pd.Timedelta(hours=1)
+        _lag_min   = (_expected - _bar_ts).total_seconds() / 60
+        log.info(
+            "[%s] features: bar=%s  lag=%.0fmin",
+            instrument, _bar_ts.strftime("%Y-%m-%dT%H:%M"), _lag_min,
+        )
+
     return last_row
 
 

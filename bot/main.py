@@ -466,6 +466,30 @@ class AcieralKairosBot:
             log.info("[%s] News block — %s", instrument, block_reason)
             return
 
+        # 5b. Feature cache freshness gate
+        # The cache update job runs at HH:00; the bar that closed at HH:00 should be
+        # present (open time = HH-1:00). If the last row is more than 70 minutes
+        # behind that expectation, the cache missed ≥1 hourly update (e.g. 401 on
+        # SPX/NAS). Trading on stale features produces direction divergence, so we
+        # skip entry — but we still allow trade management above.
+        _cache_ts = pd.Timestamp(current_candle["time"])
+        if _cache_ts.tzinfo is None:
+            _cache_ts = _cache_ts.tz_localize("UTC")
+        else:
+            _cache_ts = _cache_ts.tz_convert("UTC")
+        _expected_bar = pd.Timestamp(now).floor("H") - pd.Timedelta(hours=1)
+        _lag_min      = (_expected_bar - _cache_ts).total_seconds() / 60
+        if _lag_min > 70:
+            log.warning(
+                "[%s] Stale feature cache — last bar %s, expected ≥ %s (%.0f min lag). "
+                "Skipping entry. Fix the underlying cache update failure (check for 401).",
+                instrument,
+                _cache_ts.strftime("%Y-%m-%dT%H:%M"),
+                _expected_bar.strftime("%H:%M"),
+                _lag_min,
+            )
+            return
+
         size_mult = get_size_multiplier(instrument, now)
         opened, confidence = self.order_manager.attempt_entry(
             instrument, current_candle, current_candle, now,
@@ -880,6 +904,11 @@ class AcieralKairosBot:
                 last_cached = raw["time"].max()
                 truly_new   = new_bars[new_bars["time"] > last_cached]
 
+                # Drop bars whose H1 candle has not yet closed (open time + 1h > now).
+                # At HH:00 the current-hour bar is in-progress and must not be cached.
+                _now_utc = pd.Timestamp.now(tz="UTC")
+                truly_new = truly_new[truly_new["time"] + pd.Timedelta(hours=1) <= _now_utc]
+
                 if truly_new.empty:
                     log.debug("[%s] Feature cache: no new bars", instrument)
                     continue
@@ -906,6 +935,10 @@ class AcieralKairosBot:
                         htf_raw = pd.read_parquet(htf_path)
                         htf_raw["time"] = pd.to_datetime(htf_raw["time"], utc=True)
                         htf_new = htf_bars[htf_bars["time"] > htf_raw["time"].max()]
+                        # Drop bars whose HTF candle has not yet closed.
+                        _tf_duration = {"H4": pd.Timedelta(hours=4), "D": pd.Timedelta(days=1), "W": pd.Timedelta(weeks=1)}
+                        if htf_tf in _tf_duration:
+                            htf_new = htf_new[htf_new["time"] + _tf_duration[htf_tf] <= _now_utc]
                         if not htf_new.empty:
                             htf_raw = pd.concat([htf_raw, htf_new], ignore_index=True)
                             htf_raw = (htf_raw.drop_duplicates(subset=["time"])
