@@ -179,63 +179,35 @@ def _forward_fill_htf(
 
 def preprocess(instrument: str) -> pd.DataFrame:
     """
-    Load H1/H4/D/W parquets for `instrument`, compute indicators,
-    forward-fill higher-TF columns onto H1 rows, and return the
-    enriched H1 DataFrame (warmup rows dropped).
-    """
-    # --- Load all timeframes ---
-    h1 = _load(instrument, "H1")
-    h4 = _load(instrument, "H4")
-    d1 = _load(instrument, "D")
-    w1 = _load(instrument, "W")
+    Load H1 parquet for `instrument`, compute H1 indicators, drop warmup rows,
+    and return the enriched H1 DataFrame.
 
-    # --- H1 indicators ---
+    HTF columns (h4_ema_20, d1_ema_20, w1_high, w1_low etc.) are NO LONGER
+    computed here — they are built synthetically from H1 data by
+    strategy/feature_builder._build_htf_cols() with no look-ahead bias.
+    """
+    h1 = _load(instrument, "H1")
     h1 = _add_h1_indicators(h1)
 
-    # --- H4 indicators ---
-    h4 = _add_h4_indicators(h4)
-
-    # --- Daily indicators ---
-    d1 = _add_d1_indicators(d1)
-
-    # --- Forward-fill H4 onto H1 ---
-    h4_cols = ["h4_atr_14", "h4_ema_20", "h4_rsi_14", "h4_adx_14"]
-    h1 = _forward_fill_htf(h1, h4, h4_cols)
-
-    # --- Forward-fill Daily onto H1 ---
-    d1_cols = ["d1_atr_14", "d1_ema_20"]
-    h1 = _forward_fill_htf(h1, d1, d1_cols)
-
-    # --- Forward-fill Weekly high/low onto H1 ---
-    w1_subset = w1[["time", "high", "low"]].rename(
-        columns={"high": "w1_high", "low": "w1_low"}
-    )
-    h1 = pd.merge_asof(
-        h1,
-        w1_subset,
-        on="time",
-        direction="backward",
-    )
-
-    # --- Drop warmup rows ---
-    # Use adx_14 as the sentinel: it has the longest H1 warmup (27 bars),
-    # so dropping its NaNs also covers atr_14 (13 bars) and all RSI/EMA windows.
+    # Drop warmup rows (adx_14 has the longest warmup: 27 bars)
     before = len(h1)
     h1 = h1.dropna(subset=["adx_14"]).reset_index(drop=True)
     dropped = before - len(h1)
-
-    log.info(
-        "  [%s] H1 rows: %d (dropped %d warmup)", instrument, len(h1), dropped
-    )
+    log.info("  [%s] H1 rows: %d (dropped %d warmup)", instrument, len(h1), dropped)
     return h1
 
 
-def preprocess_instrument(instrument: str) -> None:
-    """Preprocess a single instrument — faster than preprocess_all() for hourly updates."""
+def preprocess_instrument(instrument: str) -> pd.DataFrame:
+    """Preprocess a single instrument and save *_H1_processed.parquet.
+
+    Returns the processed DataFrame so callers can chain directly into
+    build_features() without a second parquet read.
+    """
     df = preprocess(instrument)
     out_path = CACHE_DIR / f"{instrument}_H1_processed.parquet"
     df.to_parquet(out_path, index=False)
     log.info("  [%s] Saved %d rows → %s", instrument, len(df), out_path.name)
+    return df
 
 
 def preprocess_all() -> None:

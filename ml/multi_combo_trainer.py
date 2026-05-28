@@ -16,13 +16,15 @@ Full run: 3 combos × 8 instruments = up to 24 training runs (~10-15 min each).
 import json
 import logging
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
 
 from config import HARD_CONSTRAINTS
 from ml.labeler import label_instrument
-from ml.trainer import train_instrument
+from ml.trainer import train_instrument, _metadata_lock
 from backtest.engine import run_backtest
 
 log = logging.getLogger(__name__)
@@ -278,26 +280,27 @@ def run_multi_combo(
     log.info("[%s] Combo results -> %s", instrument, results_path.name)
 
     # ------------------------------------------------------------------
-    # Update metadata.json
+    # Update metadata.json (locked — multiple instruments run concurrently)
     # ------------------------------------------------------------------
     meta_path = MODELS_DIR / "metadata.json"
-    metadata: dict = {}
-    if meta_path.exists():
-        with open(meta_path) as fh:
-            metadata = json.load(fh)
+    with _metadata_lock:
+        metadata: dict = {}
+        if meta_path.exists():
+            with open(meta_path) as fh:
+                metadata = json.load(fh)
 
-    existing = metadata.get(instrument, {})
-    metadata[instrument] = {
-        **existing,
-        "N":               winner["N"],
-        "T":               winner["T"],
-        "mean_val_auc":    winner.get("mean_val_auc"),
-        "holdout_sharpe":  winner["holdout_sharpe"],
-        "holdout_pnl_gbp": winner["holdout_pnl_gbp"],
-        "combo_selection": "multi_combo",
-    }
-    with open(meta_path, "w") as fh:
-        json.dump(metadata, fh, indent=2)
+        existing = metadata.get(instrument, {})
+        metadata[instrument] = {
+            **existing,
+            "N":               winner["N"],
+            "T":               winner["T"],
+            "mean_val_auc":    winner.get("mean_val_auc"),
+            "holdout_sharpe":  winner["holdout_sharpe"],
+            "holdout_pnl_gbp": winner["holdout_pnl_gbp"],
+            "combo_selection": "multi_combo",
+        }
+        with open(meta_path, "w") as fh:
+            json.dump(metadata, fh, indent=2)
 
     return {
         "instrument": instrument,
@@ -330,35 +333,44 @@ def run_all_multi_combo() -> pd.DataFrame:
         except FileNotFoundError as exc:
             log.warning("[%s] Grid CSV not found — skipping. (%s)", instrument, exc)
 
-    total_combos  = sum(len(t) for _, _, t in instrument_plans)
-    combo_counter = [0]   # mutable so run_multi_combo can increment it
+    total_combos = sum(len(t) for _, _, t in instrument_plans)
 
     log.info(
-        "Total combos to evaluate: %d across %d instruments",
+        "Total combos to evaluate: %d across %d instruments (3 parallel, n_jobs=4 each)",
         total_combos, len(instrument_plans),
     )
 
     summary_rows: list[dict] = []
+    summary_lock = threading.Lock()
 
-    for instrument, _grid, _top3 in instrument_plans:
+    def _run_one(instrument: str) -> None:
         log.info("--- Starting %s ---", instrument)
         try:
-            res    = run_multi_combo(instrument, combo_counter, total_combos)
+            res    = run_multi_combo(instrument)
             winner = res["winner"]
-            summary_rows.append({
-                "instrument":      instrument,
-                "winner_N":        winner["N"],
-                "winner_T":        winner["T"],
-                "mean_val_auc":    winner.get("mean_val_auc"),
-                "holdout_sharpe":  winner["holdout_sharpe"],
-                "holdout_trades":  winner["holdout_trades"],
+            row = {
+                "instrument":       instrument,
+                "winner_N":         winner["N"],
+                "winner_T":         winner["T"],
+                "mean_val_auc":     winner.get("mean_val_auc"),
+                "holdout_sharpe":   winner["holdout_sharpe"],
+                "holdout_trades":   winner["holdout_trades"],
                 "holdout_win_rate": winner["holdout_win_rate"],
-                "holdout_pf":      winner["holdout_pf"],
-                "holdout_max_dd":  winner["holdout_max_dd"],
-                "holdout_pnl_gbp": winner["holdout_pnl_gbp"],
-            })
+                "holdout_pf":       winner["holdout_pf"],
+                "holdout_max_dd":   winner["holdout_max_dd"],
+                "holdout_pnl_gbp":  winner["holdout_pnl_gbp"],
+            }
+            with summary_lock:
+                summary_rows.append(row)
         except Exception as exc:
             log.error("[%s] run_multi_combo FAILED: %s", instrument, exc, exc_info=True)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(_run_one, inst): inst for inst, _, _ in instrument_plans}
+        for fut in as_completed(futures):
+            exc = fut.exception()
+            if exc:
+                log.error("[%s] unhandled: %s", futures[fut], exc)
 
     # ------------------------------------------------------------------
     # Print summary table

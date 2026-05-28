@@ -1,49 +1,55 @@
-In `acieral-kairos-bot/`, delete the following files and directories from the working tree on the main branch. These are all safely archived on `archive/pre-synthetic-htf-rebuild-2026-05-23`.
+Read CLAUDE.md in acieral-kairos-bot before doing anything.
+Extract the VPS IP, SSH user, and any connection details from that file.
+Do not print credentials or keys.
 
-Delete:
-```bash
-# Trained models
-rm -rf ml/models/entry_*.pkl ml/models/exit_*.pkl ml/models/metadata.json ml/models/exit_metadata.json
+Connect to the VPS via SSH using the details in CLAUDE.md.
+No password — use the existing SSH key.
 
-# Labels
-rm -rf ml/labels/ ml/labels_train/ ml/exit_labels/
+Then do the following steps in order, confirming each before proceeding:
 
-# Multi-combo results
-rm -rf ml/multi_combo_results/
+STEP 1 — Check current bot status:
+    sudo systemctl status acieral-kairos
+Report: is it running, how long has it been up, any recent errors in journalctl.
 
-# Backtest results
-rm -rf backtest/results/ backtest/results_train/ backtest/results_exit/
+STEP 2 — Stop the bot gracefully:
+    sudo systemctl stop acieral-kairos
+    sudo systemctl disable acieral-kairos
+Confirm it is stopped: sudo systemctl status acieral-kairos
 
-# HTF raw parquets (H4, D1, W1) — H1 stays
-find data/cache -name "*_H4*.parquet" -delete
-find data/cache -name "*_D1*.parquet" -delete
-find data/cache -name "*_W1*.parquet" -delete
-find data/cache -name "*_D.parquet" -delete
-find data/cache -name "*_W.parquet" -delete
-
-# Feature cache parquets — will be rebuilt
-find data/cache -name "*_features.parquet" -delete
-
-# Archive folder on main (not needed here, lives on archive branch)
-rm -rf archive/
-```
-
-Then commit the deletions to main:
-```bash
-git add -A
-git commit -m "chore: remove pre-rebuild artifacts from main
-
-Models, labels, backtest results, HTF parquets and feature caches
-deleted. All preserved on archive/pre-synthetic-htf-rebuild-2026-05-23.
-H1 processed parquets kept — foundation for synthetic HTF rebuild.
+STEP 3 — Check for any open OANDA positions:
+    cd ~/acieral-kairos-bot
+    source venv/bin/activate
+    python -c "
+from execution.oanda_client import OandaClient
+import os
+from dotenv import load_dotenv
+load_dotenv()
+c = OandaClient(os.getenv('OANDA_API_KEY'), os.getenv('OANDA_ACCOUNT_ID'), 'practice')
+trades = c.get_open_trades()
+print(f'Open trades: {len(trades)}')
+for t in trades:
+    print(t)
 "
-```
+If any open trades exist: report them and wait for instruction before closing.
+If zero open trades: proceed to Step 4.
 
-Verify what remains in key directories:
-```bash
-ls data/cache/
-ls ml/models/ 2>/dev/null || echo "ml/models empty or gone"
-ls ml/ 
-```
+STEP 4 — Commit all files to git:
+    cd ~/acieral-kairos-bot
+    git add -A
+    git commit -m "archive: final state before v4 replacement — $(date -u +%Y-%m-%d)"
+    git push origin main
+Report the commit hash.
 
-Report what was deleted and what remains. Do not touch H1 parquets or any Python source files.
+STEP 5 — Remove the bot files (keep the git repo, remove working directory):
+    cd ~
+    rm -rf ~/acieral-kairos-bot
+Confirm directory no longer exists: ls ~ | grep acieral
+
+STEP 6 — Remove the systemd service file:
+    sudo rm /etc/systemd/system/acieral-kairos.service
+    sudo systemctl daemon-reload
+Confirm removal.
+
+Report completion of all 6 steps with status of each.
+Do not touch forex-bot.service or any other service on the VPS.
+Do not touch acieral-kairos-v4 local build.

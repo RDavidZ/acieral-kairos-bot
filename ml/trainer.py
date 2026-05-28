@@ -12,6 +12,7 @@ Final model: all training data, mode hyperparams, sample_weight (no SMOTE).
 import json
 import logging
 import pickle
+import threading
 from datetime import datetime, timezone
 from itertools import product
 from pathlib import Path
@@ -45,6 +46,9 @@ HOLDOUT_START   = HARD_CONSTRAINTS["HOLDOUT_START"]    # "2024-01-01"
 TRAIN_MONTHS    = HARD_CONSTRAINTS["TRAINING_WINDOW_MONTHS"]  # 18
 VAL_MONTHS      = HARD_CONSTRAINTS["VALIDATION_MONTHS"]       # 3
 
+# Shared lock for concurrent metadata.json writes (instrument-level parallelism)
+_metadata_lock = threading.Lock()
+
 # XGBoost fixed parameters
 XGB_FIXED = dict(
     subsample=0.8,
@@ -54,6 +58,7 @@ XGB_FIXED = dict(
     num_class=3,
     eval_metric="mlogloss",
     tree_method="hist",
+    n_jobs=4,   # 4 threads per model; 3 parallel instruments → 12 cores total
 )
 
 # Hyperparameter grid (12 combos per fold)
@@ -436,27 +441,28 @@ def train_instrument(
 
     log.info("[%s] Model saved → %s", instrument, model_path.name)
 
-    # Save / update metadata
+    # Save / update metadata (locked — multiple instruments may write concurrently)
     metadata_path = MODELS_DIR / "metadata.json"
-    if metadata_path.exists():
-        with open(metadata_path) as f:
-            metadata = json.load(f)
-    else:
-        metadata = {}
+    with _metadata_lock:
+        if metadata_path.exists():
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+        else:
+            metadata = {}
 
-    metadata[instrument] = {
-        "N":             N,
-        "T":             T,
-        "mean_val_auc":  round(mean_auc, 6),
-        "std_val_auc":   round(std_auc, 6),
-        "best_params":   mode_params,
-        "n_folds":       len(fold_results),
-        "skipped_folds": skipped,
-        "trained_at":    datetime.now(timezone.utc).isoformat(),
-    }
+        metadata[instrument] = {
+            "N":             N,
+            "T":             T,
+            "mean_val_auc":  round(mean_auc, 6),
+            "std_val_auc":   round(std_auc, 6),
+            "best_params":   mode_params,
+            "n_folds":       len(fold_results),
+            "skipped_folds": skipped,
+            "trained_at":    datetime.now(timezone.utc).isoformat(),
+        }
 
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
 
     log.info("[%s] Metadata saved → %s", instrument, metadata_path.name)
 

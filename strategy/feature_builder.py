@@ -66,6 +66,24 @@ def _safe_atr(df: pd.DataFrame, col: str = "atr_14") -> pd.Series:
     return df[col].replace(0.0, np.nan)
 
 
+def _safe_atr_series(df: pd.DataFrame, window: int = 14) -> pd.Series:
+    """
+    ATR via EWM — works on DataFrames of any length (no minimum-rows requirement).
+    Replaces ta.volatility.AverageTrueRange on short completed-bar DataFrames.
+    """
+    high  = df["high"].reset_index(drop=True)
+    low   = df["low"].reset_index(drop=True)
+    close = df["close"].reset_index(drop=True)
+    hl = high - low
+    hc = (high - close.shift(1)).abs()
+    lc = (low  - close.shift(1)).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1.0 / window, min_periods=1, adjust=False).mean()
+    # Null out the first (window-1) rows to match _mask_warmup(warmup_bars=13)
+    atr.iloc[:window - 1] = np.nan
+    return atr.replace(0.0, np.nan)
+
+
 def _fvg_dist(close: pd.Series, top: pd.Series, bottom: pd.Series,
               atr: pd.Series) -> pd.Series:
     """
@@ -86,63 +104,148 @@ def _nearest_fvg_dist(bull_d: np.ndarray, bear_d: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# HTF processing
+# HTF processing — synthetic bars from H1 data (no OANDA HTF parquets)
 # ---------------------------------------------------------------------------
-
-def _process_htf(instrument: str, timeframe: str,
-                 n_swing: int = 10) -> pd.DataFrame:
-    """
-    Load a raw H4 or D parquet, compute ATR + EMA-20, run FVG and swing
-    detectors, and return the enriched DataFrame.
-    """
-    path = CACHE_DIR / f"{instrument}_{timeframe}.parquet"
-    df = pd.read_parquet(path)
-    df["time"] = pd.to_datetime(df["time"], utc=True)
-    df = df.sort_values("time").reset_index(drop=True)
-
-    # ATR (with warmup masking)
-    df["atr_14"] = _mask_warmup(
-        ta.volatility.AverageTrueRange(
-            high=df["high"], low=df["low"], close=df["close"], window=14
-        ).average_true_range(),
-        warmup_bars=13,
-    )
-
-    # EMA-20 for slope calculation
-    df["ema_20"] = ta.trend.EMAIndicator(
-        close=df["close"], window=20
-    ).ema_indicator()
-
-    # FVG detection
-    df = detect_fvgs(df)
-
-    # Swing detection (requires atr_14)
-    df = detect_swings_live(df, n=n_swing)
-
-    return df
-
 
 def _build_htf_cols(h1: pd.DataFrame, instrument: str,
                     n_swing: int) -> pd.DataFrame:
     """
-    Process H4 and Daily data, compute derived HTF features, and
-    merge them onto h1 via merge_asof (direction='backward').
+    Build all HTF features synthetically from H1 data — no OANDA HTF parquets.
 
-    Returns h1 augmented with all Group-4 HTF columns.
+    For each H1 bar at time T the synthetic HTF bar represents ONLY the H1 bars
+    already closed within the current period (strictly before T).
+    If T is the first bar of a new period, falls back to the previous completed
+    period's OHLCV.
+
+    Period boundaries (market-aligned, DST-aware):
+      H4 : 22/02/06/10/14/18 UTC (winter)  or  21/01/05/09/13/17 UTC (summer)
+      D1 : 22:00 UTC (winter)  /  21:00 UTC (summer)
+      W1 : most recent Friday 21:00 or 22:00 UTC
+    Both 21 and 22 are detected from the H1 timestamps directly.
     """
     atr_h1 = _safe_atr(h1)
+    h1 = h1.copy()
 
-    # ------------------------------------------------------------------ H4
-    h4 = _process_htf(instrument, "H4", n_swing)
+    times = pd.DatetimeIndex(h1["time"])
+    hours = times.hour.values
+    dow   = times.dayofweek.values          # 0=Mon … 4=Fri … 6=Sun
+    n     = len(h1)
 
-    # EMA slope on H4 granularity, normalised by H4 ATR
-    h4_atr = h4["atr_14"].replace(0.0, np.nan)
-    h4["h4_ema20_slope"] = (h4["ema_20"] - h4["ema_20"].shift(1)) / h4_atr
+    # ------------------------------------------------------------------
+    # Step 1 — Period boundary detection
+    # ------------------------------------------------------------------
 
-    h4_ff = h4[["time",
-                "fvg_bull_top", "fvg_bull_bottom",
-                "fvg_bear_top", "fvg_bear_bottom",
-                "structure_bias", "h4_ema20_slope"]].copy()
+    # D1: market day starts at hour 21 (BST/summer) or 22 (GMT/winter)
+    is_d1 = np.zeros(n, dtype=bool)
+    is_d1[(hours == 21) | (hours == 22)] = True
+    is_d1[0] = True                         # anchor first bar to a period
+    d1_pid = np.cumsum(is_d1)
+
+    # Hours elapsed since current D1 start → H4 sub-period id
+    d1_start_idxs = np.where(is_d1)[0]
+    d1_start_ns   = np.empty(n, dtype=np.int64)
+    for k, s in enumerate(d1_start_idxs):
+        e = d1_start_idxs[k + 1] if k + 1 < len(d1_start_idxs) else n
+        d1_start_ns[s:e] = times[s].value          # nanoseconds since epoch
+    elapsed_h = (times.asi8 - d1_start_ns) / 1_000_000_000 / 3600
+    h4_sub    = (elapsed_h // 4).astype(int)
+    h4_pid    = d1_pid * 10 + h4_sub               # unique H4 period id
+
+    # W1: starts at Friday (dow=4) at hour 21 or 22
+    is_w1 = np.zeros(n, dtype=bool)
+    is_w1[((hours == 21) | (hours == 22)) & (dow == 4)] = True
+    is_w1[0] = True
+    w1_pid = np.cumsum(is_w1)
+
+    # ------------------------------------------------------------------
+    # Step 2 — Partial-bar builder
+    # ------------------------------------------------------------------
+
+    def _partial_bars(pid_arr: np.ndarray) -> pd.DataFrame:
+        """
+        For each H1 bar i, return the state of its HTF period using ONLY the
+        H1 bars that have already closed (strictly before bar i).
+
+        Uses groupby cumulative stats + global shift(1):
+          - position 0 in period P → shift gives last bar of period P-1 (fallback)
+          - position k>0           → gives within-period cumulative up to bar k-1
+        """
+        pid   = pd.Series(pid_arr, index=h1.index, name="_pid")
+        frame = h1[["open", "high", "low", "close", "volume"]].copy()
+        frame["_pid"] = pid
+
+        grp = frame.groupby("_pid", sort=False)
+
+        cum_high  = grp["high"].cummax()
+        cum_low   = grp["low"].cummin()
+        cum_vol   = grp["volume"].cumsum()
+        per_open  = grp["open"].transform("first")
+
+        # Shift by 1 globally — at a period boundary this naturally picks up
+        # the previous period's final cumulative value (the fallback).
+        synth = pd.DataFrame({
+            "open":   per_open.shift(1).ffill(),
+            "high":   cum_high.shift(1).ffill(),
+            "low":    cum_low.shift(1).ffill(),
+            "close":  frame["close"].shift(1).ffill(),
+            "volume": cum_vol.shift(1).ffill().fillna(0.0),
+        }, index=h1.index)
+        return synth
+
+    # ------------------------------------------------------------------
+    # Step 3 — Completed-bar builder (one row per fully closed period)
+    # ------------------------------------------------------------------
+
+    def _completed_bars(pid_arr: np.ndarray) -> pd.DataFrame:
+        """
+        Aggregate H1 bars into one completed HTF bar per period (last H1 bar
+        of each period).  Used as input for FVG and swing detectors.
+        """
+        frame = h1[["time", "open", "high", "low", "close", "volume"]].copy()
+        frame["_pid"] = pid_arr
+        comp = (
+            frame.groupby("_pid", sort=False)
+            .agg(
+                time=("time", "last"),
+                open=("open", "first"),
+                high=("high", "max"),
+                low=("low", "min"),
+                close=("close", "last"),
+                volume=("volume", "sum"),
+            )
+            .reset_index(drop=True)
+        )
+        comp["time"] = pd.to_datetime(comp["time"], utc=True)
+        return comp
+
+    # ------------------------------------------------------------------
+    # Step 4 — H4
+    # ------------------------------------------------------------------
+    h4_part = _partial_bars(h4_pid)
+
+    h4_ema_s = ta.trend.EMAIndicator(
+        close=h4_part["close"], window=20
+    ).ema_indicator()
+    h4_atr_s = ta.volatility.AverageTrueRange(
+        high=h4_part["high"], low=h4_part["low"],
+        close=h4_part["close"], window=14,
+    ).average_true_range().replace(0.0, np.nan)
+
+    h1["h4_ema_20"]         = h4_ema_s.values
+    h1["h4_atr_14"]         = h4_atr_s.values
+    h1["h4_ema20_slope"]    = (h4_ema_s.diff(1) / h4_atr_s).values
+    h1["h4_close_vs_ema20"] = ((h4_part["close"] - h4_ema_s) / atr_h1).values
+
+    # FVG + swing on completed H4 bars → forward-fill to H1
+    h4_comp = _completed_bars(h4_pid)
+    h4_comp["atr_14"] = _safe_atr_series(h4_comp, window=14)
+    h4_comp = detect_fvgs(h4_comp)
+    h4_comp = detect_swings_live(h4_comp, n=n_swing)
+
+    h4_ff = h4_comp[["time",
+                      "fvg_bull_top", "fvg_bull_bottom",
+                      "fvg_bear_top", "fvg_bear_bottom",
+                      "structure_bias"]].copy()
     h4_ff = h4_ff.rename(columns={
         "fvg_bull_top":    "_h4_fvg_bull_top",
         "fvg_bull_bottom": "_h4_fvg_bull_bottom",
@@ -150,85 +253,88 @@ def _build_htf_cols(h1: pd.DataFrame, instrument: str,
         "fvg_bear_bottom": "_h4_fvg_bear_bottom",
         "structure_bias":  "h4_swing_bias",
     })
-
-    # Shift merge key to H4 bar close time (open + 4h) so incomplete/in-progress
-    # H4 bars only attach to H1 bars that open after the H4 bar has fully closed.
-    h4_ff["time"] = h4_ff["time"] + pd.Timedelta(hours=4)
+    # Shift +1h: completed H4 bar attaches to H1 bars in the NEXT period only
+    h4_ff["time"] = h4_ff["time"] + pd.Timedelta(hours=1)
+    h4_ff = h4_ff.sort_values("time").reset_index(drop=True)
     h1 = pd.merge_asof(h1, h4_ff, on="time", direction="backward")
 
-    # Compute H4 FVG features on H1
     h1["h4_fvg_bull_exists"] = h1["_h4_fvg_bull_top"].notna().astype(float)
     h1["h4_fvg_bear_exists"] = h1["_h4_fvg_bear_top"].notna().astype(float)
-
     bull_d = _fvg_dist(h1["close"], h1["_h4_fvg_bull_top"],
                        h1["_h4_fvg_bull_bottom"], atr_h1).values
     bear_d = _fvg_dist(h1["close"], h1["_h4_fvg_bear_top"],
                        h1["_h4_fvg_bear_bottom"], atr_h1).values
     h1["h4_fvg_dist_atr"] = _nearest_fvg_dist(bull_d, bear_d)
-
-    h1["h4_close_vs_ema20"] = (h1["close"] - h1["h4_ema_20"]) / atr_h1
-
-    # Drop temp columns
     h1 = h1.drop(columns=["_h4_fvg_bull_top", "_h4_fvg_bull_bottom",
                            "_h4_fvg_bear_top", "_h4_fvg_bear_bottom"])
 
-    # ------------------------------------------------------------------ D1
-    d1 = _process_htf(instrument, "D", n_swing)
+    # ------------------------------------------------------------------
+    # Step 5 — D1
+    # ------------------------------------------------------------------
+    d1_part = _partial_bars(d1_pid)
 
-    d1_atr = d1["atr_14"].replace(0.0, np.nan)
-    # Raw daily EMA change (will be divided by H1 atr_14 after forward-fill)
-    d1["_d1_ema_raw_change"] = d1["ema_20"] - d1["ema_20"].shift(1)
+    d1_ema_s = ta.trend.EMAIndicator(
+        close=d1_part["close"], window=20
+    ).ema_indicator()
+    d1_atr_s = ta.volatility.AverageTrueRange(
+        high=d1_part["high"], low=d1_part["low"],
+        close=d1_part["close"], window=14,
+    ).average_true_range().replace(0.0, np.nan)
 
-    d1_ff = d1[["time", "high", "low",
-                "fvg_bull_top", "fvg_bull_bottom",
-                "fvg_bear_top", "fvg_bear_bottom",
-                "structure_bias", "_d1_ema_raw_change"]].copy()
+    h1["d1_ema_20"]         = d1_ema_s.values
+    h1["d1_atr_14"]         = d1_atr_s.values
+    h1["d1_ema20_slope"]    = (d1_ema_s.diff(1) / atr_h1).values
+    h1["d1_close_vs_ema20"] = ((d1_part["close"] - d1_ema_s) / atr_h1).values
+    h1["d1_high_dist_atr"]  = ((d1_part["high"]  - h1["close"]) / atr_h1).values
+    h1["d1_low_dist_atr"]   = ((h1["close"] - d1_part["low"])   / atr_h1).values
+
+    # FVG + swing on completed D1 bars → forward-fill to H1
+    d1_comp = _completed_bars(d1_pid)
+    d1_comp["atr_14"] = _safe_atr_series(d1_comp, window=14)
+    d1_comp = detect_fvgs(d1_comp)
+    d1_comp = detect_swings_live(d1_comp, n=n_swing)
+
+    d1_ff = d1_comp[["time",
+                      "fvg_bull_top", "fvg_bull_bottom",
+                      "fvg_bear_top", "fvg_bear_bottom",
+                      "structure_bias"]].copy()
     d1_ff = d1_ff.rename(columns={
-        "high":            "d1_high",
-        "low":             "d1_low",
         "fvg_bull_top":    "_d1_fvg_bull_top",
         "fvg_bull_bottom": "_d1_fvg_bull_bottom",
         "fvg_bear_top":    "_d1_fvg_bear_top",
         "fvg_bear_bottom": "_d1_fvg_bear_bottom",
         "structure_bias":  "d1_swing_bias",
     })
-
-    # Shift merge key to D1 bar close time (open + 1 day) so today's in-progress
-    # D1 bar only attaches to tomorrow's H1 bars, matching what's knowable live.
-    d1_ff["time"] = d1_ff["time"] + pd.Timedelta(days=1)
+    # Shift +1h: completed D1 bar attaches to H1 bars in the next day only
+    d1_ff["time"] = d1_ff["time"] + pd.Timedelta(hours=1)
+    d1_ff = d1_ff.sort_values("time").reset_index(drop=True)
     h1 = pd.merge_asof(h1, d1_ff, on="time", direction="backward")
-
-    # D1 features computed on H1
-    h1["d1_ema20_slope"]   = h1["_d1_ema_raw_change"] / atr_h1
-    h1["d1_close_vs_ema20"] = (h1["close"] - h1["d1_ema_20"]) / atr_h1
-    h1["d1_high_dist_atr"] = (h1["d1_high"] - h1["close"]) / atr_h1
-    h1["d1_low_dist_atr"]  = (h1["close"] - h1["d1_low"]) / atr_h1
 
     h1["d1_fvg_bull_exists"] = h1["_d1_fvg_bull_top"].notna().astype(float)
     h1["d1_fvg_bear_exists"] = h1["_d1_fvg_bear_top"].notna().astype(float)
-
     bull_d = _fvg_dist(h1["close"], h1["_d1_fvg_bull_top"],
                        h1["_d1_fvg_bull_bottom"], atr_h1).values
     bear_d = _fvg_dist(h1["close"], h1["_d1_fvg_bear_top"],
                        h1["_d1_fvg_bear_bottom"], atr_h1).values
     h1["d1_fvg_dist_atr"] = _nearest_fvg_dist(bull_d, bear_d)
+    h1 = h1.drop(columns=["_d1_fvg_bull_top", "_d1_fvg_bull_bottom",
+                           "_d1_fvg_bear_top", "_d1_fvg_bear_bottom"])
 
     # HTF alignment: D1 and H4 biases agree in sign
-    d1_bias = h1["d1_swing_bias"].values
-    h4_bias = h1["h4_swing_bias"].values
     h1["htf_alignment"] = np.where(
-        ((d1_bias > 0) & (h4_bias > 0)) | ((d1_bias < 0) & (h4_bias < 0)),
-        1.0, 0.0
+        ((h1["d1_swing_bias"].values > 0) & (h1["h4_swing_bias"].values > 0)) |
+        ((h1["d1_swing_bias"].values < 0) & (h1["h4_swing_bias"].values < 0)),
+        1.0, 0.0,
     )
 
-    # Weekly distance features (w1_high, w1_low already on h1 from preprocessor)
+    # ------------------------------------------------------------------
+    # Step 6 — W1 (high / low only)
+    # ------------------------------------------------------------------
+    w1_part = _partial_bars(w1_pid)
+    h1["w1_high"] = w1_part["high"].values
+    h1["w1_low"]  = w1_part["low"].values
     h1["w1_high_dist_atr"] = (h1["w1_high"] - h1["close"]) / atr_h1
     h1["w1_low_dist_atr"]  = (h1["close"]   - h1["w1_low"]) / atr_h1
-
-    # Drop temp columns
-    h1 = h1.drop(columns=["_d1_fvg_bull_top", "_d1_fvg_bull_bottom",
-                           "_d1_fvg_bear_top", "_d1_fvg_bear_bottom",
-                           "_d1_ema_raw_change"])
 
     return h1
 
@@ -433,19 +539,23 @@ def _merge_supplementary(df: pd.DataFrame, instrument: str,
 # Main feature computation
 # ---------------------------------------------------------------------------
 
-def build_features(instrument: str, n_swing: int = 10) -> pd.DataFrame:
+def build_features(instrument: str, df: pd.DataFrame = None,
+                   n_swing: int = 10) -> pd.DataFrame:
     """
     Build the full feature set for one instrument.
 
-    Loads *_H1_processed.parquet, runs FVG + swing detectors, computes all
-    ~80 features across 8 groups, and returns the enriched H1 DataFrame.
+    If `df` is supplied it is used directly (must be a preprocessed H1
+    DataFrame with time, open, high, low, close, volume + H1 indicator
+    columns).  Otherwise the cached *_H1_processed.parquet is loaded.
+
     No rows are removed — NaN handling is the labeller's responsibility.
     """
     log.info("Building features for %s …", instrument)
 
     # ------------------------------------------------------------------ load
-    path = CACHE_DIR / f"{instrument}_H1_processed.parquet"
-    df = pd.read_parquet(path)
+    if df is None:
+        path = CACHE_DIR / f"{instrument}_H1_processed.parquet"
+        df = pd.read_parquet(path)
     df["time"] = pd.to_datetime(df["time"], utc=True)
     df = df.sort_values("time").reset_index(drop=True)
 
@@ -600,12 +710,7 @@ def build_live_features(
     ------
     ValueError if live_h1_df has fewer than 50 rows (insufficient warmup).
     """
-    from data.preprocessor import (
-        _add_h1_indicators,
-        _add_h4_indicators,
-        _add_d1_indicators,
-        _forward_fill_htf,
-    )
+    from data.preprocessor import _add_h1_indicators
 
     if len(live_h1_df) < 50:
         raise ValueError(
@@ -620,31 +725,8 @@ def build_live_features(
     # ------------------------------------------------- H1 indicators
     df = _add_h1_indicators(df)
 
-    # ------------------------------------------------- H4 forward-fill
-    h4_path = CACHE_DIR / f"{instrument}_H4.parquet"
-    h4 = pd.read_parquet(h4_path)
-    h4["time"] = pd.to_datetime(h4["time"], utc=True)
-    h4 = h4.sort_values("time").reset_index(drop=True)
-    h4 = _add_h4_indicators(h4)
-    df = _forward_fill_htf(df, h4, ["h4_atr_14", "h4_ema_20", "h4_rsi_14", "h4_adx_14"])
-
-    # ------------------------------------------------- D1 forward-fill
-    d1_path = CACHE_DIR / f"{instrument}_D.parquet"
-    d1 = pd.read_parquet(d1_path)
-    d1["time"] = pd.to_datetime(d1["time"], utc=True)
-    d1 = d1.sort_values("time").reset_index(drop=True)
-    d1 = _add_d1_indicators(d1)
-    df = _forward_fill_htf(df, d1, ["d1_atr_14", "d1_ema_20"])
-
-    # ------------------------------------------------- W1 forward-fill
-    w1_path = CACHE_DIR / f"{instrument}_W.parquet"
-    w1 = pd.read_parquet(w1_path)
-    w1["time"] = pd.to_datetime(w1["time"], utc=True)
-    w1 = w1.sort_values("time").reset_index(drop=True)
-    w1_subset = w1[["time", "high", "low"]].rename(
-        columns={"high": "w1_high", "low": "w1_low"}
-    )
-    df = pd.merge_asof(df, w1_subset, on="time", direction="backward")
+    # HTF columns (h4_ema_20, d1_ema_20, w1_high, w1_low) are computed
+    # synthetically by _build_htf_cols below — no OANDA HTF parquets needed.
 
     # ------------------------------------------------ H1 detectors
     df = detect_fvgs(df)
